@@ -1,3 +1,102 @@
+package com.example.voiceassistant
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.view.Gravity
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+class MainActivity : ComponentActivity() {
+
+    private lateinit var status: TextView
+    private lateinit var enrollBtn: Button
+    private lateinit var listenBtn: Button
+    private lateinit var verifier: SpeakerVerifier
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private val worker = Executors.newSingleThreadExecutor()
+    @Volatile private var listening = false
+
+    private val WAKE_PHRASE = "Hey MS"
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        verifier = SpeakerVerifier(this)
+        buildUi()
+        initTts()
+        ensureMicPermission()
+        refreshState()
+    }
+
+    private fun buildUi() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(48, 48, 48, 48)
+        }
+        status = TextView(this).apply { textSize = 18f; gravity = Gravity.CENTER }
+        enrollBtn = Button(this).apply {
+            text = "Enroll my voice"
+            setOnClickListener { startEnrollment() }
+        }
+        listenBtn = Button(this).apply {
+            text = "Start listening"
+            setOnClickListener { toggleListening() }
+        }
+        val resetBtn = Button(this).apply {
+            text = "Reset my voice"
+            setOnClickListener { verifier.clearEnrollment(); refreshState() }
+        }
+        root.addView(status)
+        root.addView(enrollBtn)
+        root.addView(listenBtn)
+        root.addView(resetBtn)
+        setContentView(root)
+    }
+
+    private fun setStatus(s: String) = runOnUiThread { status.text = s }
+
+    private fun refreshState() {
+        when {
+            !verifier.modelAvailable() ->
+                setStatus("speaker_model.tflite assets-la illa.\nREADME paarunga.")
+            !verifier.isEnrolled() ->
+                setStatus("Munnadi 'Enroll my voice' click pannunga.")
+            else -> setStatus("Ready. 'Start listening' click pannunga.")
+        }
+    }
+
+    private fun startEnrollment() {
+        if (!verifier.modelAvailable()) { refreshState(); return }
+        if (listening) toggleListening()
+        worker.execute {
+            val samples = ArrayList<ShortArray>()
+            for (i in 1..3) {
+                setStatus("Sample $i/3: \"$WAKE_PHRASE\" nu sollunga...")
+                val a = AudioCapture.recordUtterance()
+                if (a == null) { setStatus("Voice kekkala. Marupadi try pannunga."); return@execute }
+                samples.add(a)
+                Thread.sleep(800)
+            }
+            try {
+                verifier.enroll(samples)
+                setStatus("Voice enroll aachu. Ippo 'Start listening' click pannunga.")
+            } catch (e: Exception) {
+                setStatus("Enroll fail: ${e.message}")
             }
         }
     }
