@@ -21,11 +21,9 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Model-free speaker verification (no .tflite needed).
- * Each recording is turned into an MFCC sequence. At enrollment we keep the owner's samples and
- * measure how different they are from each other (d0). Later, a new utterance is compared to the
- * samples with DTW. score = d0 / distance. About 1.0 means "as close as my own samples".
- * Works best for the same phrase, in a quiet room.
+ * Model-free speaker verification. Voice is enrolled for one or more phrases
+ * (for example "Hey MS" and "MS"). Each phrase has its own group of samples.
+ * score = best (d0 / distance) over the groups. About 1.0 = as close as the owner's own samples.
  */
 class SpeakerVerifier(private val context: Context) {
 
@@ -33,7 +31,7 @@ class SpeakerVerifier(private val context: Context) {
         const val DEFAULT_THRESHOLD = 0.70f // higher = stricter
         private const val PREFS = "voice_prefs"
         private const val KEY_THRESHOLD = "threshold"
-        private const val FILE_NAME = "voiceprint.bin"
+        private const val FILE_NAME = "voiceprint2.bin"
 
         private const val SR = 16000
         private const val FRAME = 400
@@ -76,14 +74,14 @@ class SpeakerVerifier(private val context: Context) {
         }
     }
 
-    private class VoicePrint(val d0: Double, val templates: List<Array<DoubleArray>>)
+    private class Group(val d0: Double, val templates: List<Array<DoubleArray>>)
+    private class VoicePrint(val groups: List<Group>)
 
     private var cached: VoicePrint? = null
 
     private val prefs get() = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private val file get() = File(context.filesDir, FILE_NAME)
 
-    /** No model file is needed any more. */
     fun modelAvailable(): Boolean = true
 
     fun isEnrolled(): Boolean = file.exists()
@@ -92,30 +90,39 @@ class SpeakerVerifier(private val context: Context) {
         get() = prefs.getFloat(KEY_THRESHOLD, DEFAULT_THRESHOLD)
         set(v) { prefs.edit().putFloat(KEY_THRESHOLD, v).apply() }
 
-    /** Save the owner's voice from several samples of the same phrase. */
-    fun enroll(samples: List<ShortArray>) {
-        val t = samples.mapNotNull { features(it) }
-        require(t.size >= 2) { "Voice romba kuraivu, marupadi pesunga" }
+    /** One phrase only. */
+    fun enroll(samples: List<ShortArray>) = enrollGroups(listOf(samples))
 
-        var sum = 0.0
-        var cnt = 0
-        for (i in t.indices) {
-            for (j in i + 1 until t.size) {
-                sum += dtw(t[i], t[j])
-                cnt++
+    /** Several phrases, each with its own list of samples. */
+    fun enrollGroups(groups: List<List<ShortArray>>) {
+        val built = ArrayList<Group>()
+        for (g in groups) {
+            val t = g.mapNotNull { features(it) }
+            if (t.size < 2) continue
+            var sum = 0.0
+            var cnt = 0
+            for (i in t.indices) {
+                for (j in i + 1 until t.size) {
+                    sum += dtw(t[i], t[j])
+                    cnt++
+                }
             }
+            built.add(Group(max(sum / cnt, 1e-3), t))
         }
-        val d0 = max(sum / cnt, 1e-3)
+        require(built.isNotEmpty()) { "Voice romba kuraivu, marupadi pesunga" }
 
         DataOutputStream(BufferedOutputStream(FileOutputStream(file))).use { out ->
-            out.writeDouble(d0)
-            out.writeInt(t.size)
-            for (seq in t) {
-                out.writeInt(seq.size)
-                for (frame in seq) for (v in frame) out.writeDouble(v)
+            out.writeInt(built.size)
+            for (g in built) {
+                out.writeDouble(g.d0)
+                out.writeInt(g.templates.size)
+                for (seq in g.templates) {
+                    out.writeInt(seq.size)
+                    for (frame in seq) for (v in frame) out.writeDouble(v)
+                }
             }
         }
-        cached = VoicePrint(d0, t)
+        cached = VoicePrint(built)
     }
 
     fun clearEnrollment() {
@@ -127,10 +134,14 @@ class SpeakerVerifier(private val context: Context) {
     fun score(audio: ShortArray): Float {
         val vp = load() ?: return -1f
         val f = features(audio) ?: return 0f
-        var sum = 0.0
-        for (t in vp.templates) sum += dtw(f, t)
-        val d = max(sum / vp.templates.size, 1e-6)
-        return min(vp.d0 / d, 2.0).toFloat()
+        var best = 0.0
+        for (g in vp.groups) {
+            var sum = 0.0
+            for (t in g.templates) sum += dtw(f, t)
+            val d = max(sum / g.templates.size, 1e-6)
+            best = max(best, g.d0 / d)
+        }
+        return min(best, 2.0).toFloat()
     }
 
     fun isOwner(audio: ShortArray): Boolean = score(audio) >= threshold
@@ -142,14 +153,19 @@ class SpeakerVerifier(private val context: Context) {
         if (!file.exists()) return null
         return try {
             DataInputStream(BufferedInputStream(FileInputStream(file))).use { inp ->
-                val d0 = inp.readDouble()
-                val count = inp.readInt()
-                val list = ArrayList<Array<DoubleArray>>()
-                for (k in 0 until count) {
-                    val frames = inp.readInt()
-                    list.add(Array(frames) { DoubleArray(NCEP) { inp.readDouble() } })
+                val groupCount = inp.readInt()
+                val list = ArrayList<Group>()
+                for (gi in 0 until groupCount) {
+                    val d0 = inp.readDouble()
+                    val count = inp.readInt()
+                    val templates = ArrayList<Array<DoubleArray>>()
+                    for (k in 0 until count) {
+                        val frames = inp.readInt()
+                        templates.add(Array(frames) { DoubleArray(NCEP) { inp.readDouble() } })
+                    }
+                    list.add(Group(d0, templates))
                 }
-                VoicePrint(d0, list)
+                VoicePrint(list)
             }.also { cached = it }
         } catch (e: Exception) {
             null
