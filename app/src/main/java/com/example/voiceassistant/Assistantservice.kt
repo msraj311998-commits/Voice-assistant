@@ -12,6 +12,7 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
@@ -19,6 +20,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.Process
 import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -47,6 +49,9 @@ class AssistantService : Service() {
         const val ACTION_STOP = "com.example.voiceassistant.STOP"
         const val PREFS = "voice_prefs"
         const val KEY_TAMIL = "use_tamil"
+        const val KEY_WAKE_TH = "wake_threshold"
+        const val DEFAULT_WAKE_TH = 0.80f
+        const val SHOW_SCORE = true
         private const val CHANNEL_ID = "ms_assistant"
         private const val NOTIF_ID = 1
 
@@ -72,11 +77,14 @@ class AssistantService : Service() {
     @Volatile private var ttsReady = false
     @Volatile private var tamilActive = false
     @Volatile private var appliedTamil = -1
+    @Volatile private var warnedNoTamil = false
 
     private var recognizer: SpeechRecognizer? = null
     private var tone: ToneGenerator? = null
-    @Volatile private var sttResult: String? = null
+    @Volatile private var sttResults: List<String> = emptyList()
     @Volatile private var sttLatch: CountDownLatch? = null
+
+    private var focusReq: AudioFocusRequest? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
@@ -106,7 +114,12 @@ class AssistantService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            running = false
+            alwaysOn = false
+            removeBubbleNow()
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
+            mainHandler.postDelayed({ Process.killProcess(Process.myPid()) }, 400)
         }
         return START_NOT_STICKY
     }
@@ -114,15 +127,24 @@ class AssistantService : Service() {
     override fun onDestroy() {
         running = false
         alwaysOn = false
+        removeBubbleNow()
+        dropFocus()
         try {
-            bubble?.let { wm.removeView(it) }
+            recognizer?.destroy()
         } catch (e: Exception) {
         }
-        recognizer?.destroy()
         tone?.release()
         tts?.shutdown()
         worker.shutdownNow()
         super.onDestroy()
+    }
+
+    private fun removeBubbleNow() {
+        try {
+            bubble?.let { wm.removeView(it) }
+        } catch (e: Exception) {
+        }
+        bubble = null
     }
 
     // ---------- Foreground notification ----------
@@ -259,6 +281,9 @@ class AssistantService : Service() {
 
     // ---------- Main loop (runs on worker thread) ----------
 
+    private fun wakeThreshold(): Float =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).getFloat(KEY_WAKE_TH, DEFAULT_WAKE_TH)
+
     private fun mainLoop() {
         while (running) {
             if (talkRequested) {
@@ -269,7 +294,7 @@ class AssistantService : Service() {
             if (!alwaysOn) {
                 setState(STATE_OFF)
                 try {
-                    Thread.sleep(150)
+                    Thread.sleep(120)
                 } catch (e: InterruptedException) {
                     return
                 }
@@ -280,41 +305,103 @@ class AssistantService : Service() {
             val audio = AudioCapture.recordUtterance(
                 waitForSpeechMs = 5000,
                 maxSpeechMs = 2500,
-                endSilenceMs = 350,
+                endSilenceMs = 300,
                 shouldStop = { !running || !alwaysOn || talkRequested }
             ) ?: continue
             if (!running || !alwaysOn || talkRequested) continue
 
             val score = verifier.score(audio)
-            if (score >= verifier.threshold) runCommandFlow()
+            val th = wakeThreshold()
+            if (SHOW_SCORE) {
+                toast(String.format(Locale.US, "Voice match %.2f (need %.2f)", score, th))
+            }
+            if (score >= th) {
+                // let the microphone free up before speech recognition starts
+                try {
+                    Thread.sleep(350)
+                } catch (e: InterruptedException) {
+                    return
+                }
+                runCommandFlow()
+            }
         }
     }
 
     private fun runCommandFlow() {
         setState(STATE_HEARING)
+        takeFocus()
         beep()
-        val command = listenForCommand()
-        if (command == null) {
+        val candidates = listenForCommands()
+        if (candidates.isEmpty()) {
+            dropFocus()
             setState(if (alwaysOn) STATE_WAKE else STATE_OFF)
             return
         }
 
-        val reply = Brain.reply(this, command)
+        var chosen: Reply? = null
+        var said = candidates[0]
+        for (c in candidates) {
+            val r = Brain.reply(this, c)
+            if (r.understood) {
+                chosen = r
+                said = c
+                break
+            }
+        }
+        val reply = chosen ?: Brain.reply(this, candidates[0])
+
         applyLanguageIfNeeded()
         val spoken = if (tamilActive) reply.tamil else reply.tanglish
-        toast("Neenga: $command\nMS: $spoken")
+        if (wantTamil() && !tamilActive && !warnedNoTamil) {
+            warnedNoTamil = true
+            toast("Tamil voice illa. Phone Settings > Text-to-speech > Google > Tamil voice install pannunga.")
+        }
+        toast("Neenga: $said\nMS: $spoken")
 
         reply.action?.let { act -> mainHandler.post { act(this@AssistantService) } }
         if (reply.stopListening) alwaysOn = false
 
         setState(STATE_SPEAKING)
         speakAndWait(spoken)
+        dropFocus()
         setState(if (alwaysOn) STATE_WAKE else STATE_OFF)
     }
 
     private fun beep() {
-        tone?.startTone(ToneGenerator.TONE_PROP_ACK, 120)
-        Thread.sleep(220)
+        tone?.startTone(ToneGenerator.TONE_PROP_ACK, 100)
+        try {
+            Thread.sleep(150)
+        } catch (e: InterruptedException) {
+        }
+    }
+
+    // ---------- Audio focus (pauses songs / videos while MS listens and speaks) ----------
+
+    private fun takeFocus() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setOnAudioFocusChangeListener { }
+                .build()
+            am.requestAudioFocus(req)
+            focusReq = req
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun dropFocus() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            focusReq?.let { am.abandonAudioFocusRequest(it) }
+        } catch (e: Exception) {
+        }
+        focusReq = null
     }
 
     // ---------- Speech-to-text ----------
@@ -324,7 +411,7 @@ class AssistantService : Service() {
         val rec = SpeechRecognizer.createSpeechRecognizer(this)
         rec.setRecognitionListener(object : RecognitionListener {
             override fun onResults(r: Bundle?) {
-                sttResult = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                sttResults = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: emptyList()
                 sttLatch?.countDown()
             }
             override fun onError(error: Int) { sttLatch?.countDown() }
@@ -339,23 +426,23 @@ class AssistantService : Service() {
         recognizer = rec
     }
 
-    private fun listenForCommand(): String? {
-        val rec = recognizer ?: return null
+    private fun listenForCommands(): List<String> {
+        val rec = recognizer ?: return emptyList()
         val latch = CountDownLatch(1)
-        sttResult = null
+        sttResults = emptyList()
         sttLatch = latch
 
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ta-IN")
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
-        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 500L)
 
         mainHandler.post { rec.startListening(intent) }
-        val finished = latch.await(12, TimeUnit.SECONDS)
+        val finished = latch.await(10, TimeUnit.SECONDS)
         if (!finished) mainHandler.post { rec.cancel() }
-        return sttResult
+        return sttResults.filter { it.isNotBlank() }
     }
 
     // ---------- Text-to-speech ----------
@@ -367,7 +454,8 @@ class AssistantService : Service() {
         tts = TextToSpeech(this) { code ->
             if (code == TextToSpeech.SUCCESS) {
                 val engine = tts
-                engine?.setSpeechRate(1.0f)
+                engine?.setSpeechRate(0.95f)
+                engine?.setPitch(1.0f)
                 engine?.setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
