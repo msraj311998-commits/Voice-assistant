@@ -177,6 +177,12 @@ class MainActivity : ComponentActivity() {
 
     private fun ensurePermissions() {
         val need = ArrayList<String>()
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            need.add(Manifest.permission.READ_CONTACTS)
+        }
+        if (checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            need.add(Manifest.permission.CALL_PHONE)
+        }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             need.add(Manifest.permission.RECORD_AUDIO)
         }
