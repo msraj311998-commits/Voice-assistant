@@ -23,9 +23,7 @@
     </queries>
 
     <application
-        android:allowBackup="false"
-        android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher"
+        android:allowBackup="false
         android:label="MS"
         android:theme="@android:style/Theme.DeviceDefault.Light">
 
