@@ -8,9 +8,14 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.media.AudioAttributes
 import android.media.AudioManager
+import android.media.Ringtone
+import android.media.RingtoneManager
 import android.net.Uri
 import android.os.BatteryManager
+import android.os.Handler
+import android.os.Looper
 import android.provider.AlarmClock
 import android.provider.ContactsContract
 import android.provider.Settings
@@ -34,6 +39,11 @@ object Brain {
     private val rnd = Random()
     private var torchOn = false
     private var lastJoke = -1
+
+    // timer that lives inside MS
+    private val timerHandler = Handler(Looper.getMainLooper())
+    private var timerTask: Runnable? = null
+    private var ringtone: Ringtone? = null
 
     // ---------------- helpers ----------------
 
@@ -105,6 +115,11 @@ object Brain {
     fun reply(ctx: Context, commandRaw: String): Reply {
         val t = commandRaw.lowercase(Locale.ROOT).trim()
         if (t.isEmpty()) return fallback()
+
+        if (ringtone != null && (wantsOff(t) || has(t, "stop", "நிறுத்து", "போதும்", "ok", "ஓகே"))) {
+            stopRing()
+            return Reply("Sari, nirutthiten", "சரி, நிறுத்திட்டேன்")
+        }
 
         torch(t)?.let { return it }
         alarm(t)?.let { return it }
@@ -194,14 +209,18 @@ object Brain {
     private fun alarm(t: String): Reply? {
         if (!has(t, "alarm", "alaram", "அலாரம்", "அலாரத்", "அலார")) return null
         if (wantsOff(t)) {
-            return Reply("Sari, alarm-a nirutthuren", "சரி, அலாரத்தை நிறுத்துறேன்", { c ->
-                launchOr(
-                    c,
-                    Intent(AlarmClock.ACTION_DISMISS_ALARM)
-                        .putExtra(AlarmClock.EXTRA_ALARM_SEARCH_MODE, AlarmClock.ALARM_SEARCH_MODE_NEXT),
-                    Intent(AlarmClock.ACTION_SHOW_ALARMS)
-                )
-            })
+            return Reply(
+                "Alarm list thirakkuren. Neenga off pannunga.",
+                "அலாரம் லிஸ்ட் திறக்கிறேன். நீங்க ஆஃப் பண்ணுங்க.",
+                { c ->
+                    launchOr(
+                        c,
+                        Intent(AlarmClock.ACTION_SHOW_ALARMS),
+                        Intent(AlarmClock.ACTION_DISMISS_ALARM)
+                            .putExtra(AlarmClock.EXTRA_ALARM_SEARCH_MODE, AlarmClock.ALARM_SEARCH_MODE_NEXT)
+                    )
+                }
+            )
         }
         val time = parseClock(t)
             ?: return Reply(
@@ -222,14 +241,55 @@ object Brain {
         })
     }
 
-    // ---------------- timer ----------------
+    // ---------------- timer (runs inside MS) ----------------
+
+    private fun stopRing() {
+        try {
+            ringtone?.stop()
+        } catch (e: Exception) {
+        }
+        ringtone = null
+    }
+
+    private fun cancelTimer(): Boolean {
+        val had = timerTask != null || ringtone != null
+        timerTask?.let { timerHandler.removeCallbacks(it) }
+        timerTask = null
+        stopRing()
+        return had
+    }
+
+    private fun startTimer(ctx: Context, secs: Int) {
+        cancelTimer()
+        val app = ctx.applicationContext
+        val r = Runnable {
+            timerTask = null
+            Toast.makeText(app, "Timer mudinjaduchu!", Toast.LENGTH_LONG).show()
+            try {
+                val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                val rt = RingtoneManager.getRingtone(app, uri)
+                rt.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                rt.play()
+                ringtone = rt
+                timerHandler.postDelayed({ stopRing() }, 30000)
+            } catch (e: Exception) {
+            }
+        }
+        timerTask = r
+        timerHandler.postDelayed(r, secs * 1000L)
+    }
 
     private fun timer(t: String): Reply? {
         if (!has(t, "timer", "டைமர்", "countdown")) return null
         if (wantsOff(t)) {
-            return Reply("Sari, timer-a nirutthuren", "சரி, டைமரை நிறுத்துறேன்", { c ->
-                launchOr(c, Intent(AlarmClock.ACTION_DISMISS_TIMER), Intent(AlarmClock.ACTION_SHOW_TIMERS))
-            })
+            val had = cancelTimer()
+            return if (had) Reply("Sari, timer-a nirutthiten", "சரி, டைமரை நிறுத்திட்டேன்")
+            else Reply("Timer edhuvum odala", "டைமர் எதுவும் ஓடல")
         }
         val n = findNumber(t)
             ?: return Reply(
@@ -245,14 +305,7 @@ object Brain {
         else if (secs % 60 == 0) "${secs / 60} nimisham" else "$secs vinadi"
         val shownTa = if (secs % 3600 == 0 && secs >= 3600) "${secs / 3600} மணி நேரம்"
         else if (secs % 60 == 0) "${secs / 60} நிமிடம்" else "$secs விநாடி"
-        return Reply("$shown timer vachuten", "$shownTa டைமர் வெச்சுட்டேன்", { c ->
-            launch(
-                c,
-                Intent(AlarmClock.ACTION_SET_TIMER)
-                    .putExtra(AlarmClock.EXTRA_LENGTH, secs)
-                    .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-            )
-        })
+        return Reply("$shown timer vachuten", "$shownTa டைமர் வெச்சுட்டேன்", { c -> startTimer(c, secs) })
     }
 
     // ---------------- volume ----------------
@@ -516,7 +569,7 @@ object Brain {
         })
     }
 
-    // ---------------- settings and apps ----------------
+    // ---------------- settings panels and apps ----------------
 
     private fun wifiBt(t: String): Reply? {
         if (has(t, "wifi", "wi-fi", "வைஃபை", "வைபை", "வை-பை")) {
@@ -528,6 +581,28 @@ object Brain {
             return Reply("Bluetooth settings open pannuren", "ப்ளூடூத் செட்டிங்ஸ் திறக்கிறேன்", { c ->
                 launch(c, Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
             })
+        }
+        if (Regex("\\b(data|mobile data)\\b").containsMatchIn(t) ||
+            has(t, "டேட்டா", "மொபைல் டேட்டா", "இன்டர்நெட் ஆன்", "இன்டர்நெட் ஆஃப்", "internet on", "internet off")
+        ) {
+            return Reply(
+                "Data panel thirakkuren. Neenga toggle pannunga.",
+                "டேட்டா பேனல் திறக்கிறேன். நீங்க டாகிள் பண்ணுங்க.",
+                { c ->
+                    launchOr(
+                        c,
+                        Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY),
+                        Intent(Settings.ACTION_WIRELESS_SETTINGS)
+                    )
+                }
+            )
+        }
+        if (has(t, "location", "லொகேஷன்", "லோகேஷன்", "gps", "ஜிபிஎஸ்", "இருப்பிடம்")) {
+            return Reply(
+                "Location settings thirakkuren. Neenga on/off pannunga.",
+                "லொகேஷன் செட்டிங்ஸ் திறக்கிறேன். நீங்க ஆன்/ஆஃப் பண்ணுங்க.",
+                { c -> launch(c, Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) }
+            )
         }
         return null
     }
