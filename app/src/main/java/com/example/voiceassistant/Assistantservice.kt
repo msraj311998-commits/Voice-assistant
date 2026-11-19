@@ -28,6 +28,7 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -46,6 +47,7 @@ import kotlin.math.abs
 class AssistantService : Service() {
 
     companion object {
+        const val VERSION = "v3"
         const val ACTION_STOP = "com.example.voiceassistant.STOP"
         const val PREFS = "voice_prefs"
         const val KEY_TAMIL = "use_tamil"
@@ -109,6 +111,7 @@ class AssistantService : Service() {
         initRecognizer()
         showBubble()
         ensureVolume()
+        toast("MS $VERSION ready")
         worker.execute { mainLoop() }
     }
 
@@ -117,9 +120,12 @@ class AssistantService : Service() {
             running = false
             alwaysOn = false
             removeBubbleNow()
-            stopForeground(STOP_FOREGROUND_REMOVE)
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (e: Exception) {
+            }
             stopSelf()
-            mainHandler.postDelayed({ Process.killProcess(Process.myPid()) }, 400)
+            mainHandler.postDelayed({ Process.killProcess(Process.myPid()) }, 300)
         }
         return START_NOT_STICKY
     }
@@ -160,7 +166,7 @@ class AssistantService : Service() {
             PendingIntent.FLAG_IMMUTABLE
         )
         val n = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("MS odudhu")
+            .setContentTitle("MS $VERSION odudhu")
             .setContentText("Bubble tap = pesalam, long-press = Hey MS on/off")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
@@ -209,28 +215,43 @@ class AssistantService : Service() {
     }
 
     private inner class BubbleTouch(private val lp: WindowManager.LayoutParams) : View.OnTouchListener {
+        private val slop = 24 * resources.displayMetrics.density
         private var startX = 0
         private var startY = 0
         private var downX = 0f
         private var downY = 0f
-        private var downTime = 0L
         private var dragged = false
+        private var longFired = false
+        private var touchedView: View? = null
+
+        private val longRunnable = Runnable {
+            if (!dragged) {
+                longFired = true
+                touchedView?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                toggleAlways()
+            }
+        }
 
         override fun onTouch(v: View, e: MotionEvent): Boolean {
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
+                    touchedView = v
                     startX = lp.x
                     startY = lp.y
                     downX = e.rawX
                     downY = e.rawY
-                    downTime = System.currentTimeMillis()
                     dragged = false
+                    longFired = false
+                    mainHandler.postDelayed(longRunnable, 500)
                     return true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = e.rawX - downX
                     val dy = e.rawY - downY
-                    if (abs(dx) > 12 || abs(dy) > 12) dragged = true
+                    if (!dragged && (abs(dx) > slop || abs(dy) > slop)) {
+                        dragged = true
+                        mainHandler.removeCallbacks(longRunnable)
+                    }
                     if (dragged) {
                         lp.x = startX + dx.toInt()
                         lp.y = startY + dy.toInt()
@@ -239,10 +260,12 @@ class AssistantService : Service() {
                     return true
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!dragged) {
-                        val held = System.currentTimeMillis() - downTime
-                        if (held >= 600) toggleAlways() else requestTalk()
-                    }
+                    mainHandler.removeCallbacks(longRunnable)
+                    if (!dragged && !longFired) requestTalk()
+                    return true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    mainHandler.removeCallbacks(longRunnable)
                     return true
                 }
             }
@@ -316,7 +339,6 @@ class AssistantService : Service() {
                 toast(String.format(Locale.US, "Voice match %.2f (need %.2f)", score, th))
             }
             if (score >= th) {
-                // let the microphone free up before speech recognition starts
                 try {
                     Thread.sleep(350)
                 } catch (e: InterruptedException) {
@@ -348,9 +370,9 @@ class AssistantService : Service() {
                 break
             }
         }
-        val reply = chosen ?: Brain.reply(this, candidates[0])
 
         applyLanguageIfNeeded()
+        val reply = chosen ?: aiReply(candidates[0])
         val spoken = if (tamilActive) reply.tamil else reply.tanglish
         if (wantTamil() && !tamilActive && !warnedNoTamil) {
             warnedNoTamil = true
@@ -365,6 +387,31 @@ class AssistantService : Service() {
         speakAndWait(spoken)
         dropFocus()
         setState(if (alwaysOn) STATE_WAKE else STATE_OFF)
+    }
+
+    /** Rules did not understand: ask the AI (needs internet and an API key). */
+    private fun aiReply(question: String): Reply {
+        if (!AiChat.isConfigured(this)) return Brain.reply(this, question)
+        if (!AiChat.hasInternet(this)) {
+            return Reply(
+                "Idhukku internet venum. Ippo internet illa.",
+                "இதுக்கு இன்டர்நெட் வேணும். இப்போ இன்டர்நெட் இல்ல."
+            )
+        }
+        toast("Yosikkiren...")
+        return try {
+            val a = AiChat.ask(this, question, tamilActive)
+            Reply(a, a)
+        } catch (e: Exception) {
+            val m = e.message ?: "error"
+            if (m.contains("401") || m.contains("403")) {
+                Reply("API key thappu, AI settings-la check pannunga.", "API கீ தப்பு, AI செட்டிங்ஸ்ல செக் பண்ணுங்க.")
+            } else if (m.contains("429")) {
+                Reply("AI limit mudinjiduchu, konjam neram kazhichu try pannunga.", "AI லிமிட் முடிஞ்சிடுச்சு, கொஞ்ச நேரம் கழிச்சு ட்ரை பண்ணுங்க.")
+            } else {
+                Reply("AI-kitta pesa mudiyala.", "AI கிட்ட பேச முடியல.")
+            }
+        }
     }
 
     private fun beep() {
@@ -501,7 +548,7 @@ class AssistantService : Service() {
         val params = Bundle()
         params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
         engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
-        latch.await(20, TimeUnit.SECONDS)
+        latch.await(25, TimeUnit.SECONDS)
     }
 
     private fun ensureVolume() {
