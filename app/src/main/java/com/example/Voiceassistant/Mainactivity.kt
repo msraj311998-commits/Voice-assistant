@@ -1,6 +1,7 @@
 package com.example.voiceassistant
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -10,18 +11,23 @@ import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var status: TextView
     private lateinit var voiceBtn: Button
+    private lateinit var strictBtn: Button
     private lateinit var verifier: SpeakerVerifier
     private val worker = Executors.newSingleThreadExecutor()
+    private val levels = floatArrayOf(0.60f, 0.70f, 0.80f, 0.90f)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -29,6 +35,7 @@ class MainActivity : ComponentActivity() {
         buildUi()
         ensurePermissions()
         updateVoiceButton()
+        updateStrictButton()
     }
 
     override fun onResume() {
@@ -41,7 +48,7 @@ class MainActivity : ComponentActivity() {
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
+            gravity = Gravity.CENTER_HORIZONTAL
             setPadding(48, 48, 48, 48)
         }
         status = TextView(this).apply { textSize = 18f; gravity = Gravity.CENTER }
@@ -64,6 +71,13 @@ class MainActivity : ComponentActivity() {
         voiceBtn = Button(this).apply {
             setOnClickListener { toggleVoice() }
         }
+        strictBtn = Button(this).apply {
+            setOnClickListener { cycleStrictness() }
+        }
+        val aiBtn = Button(this).apply {
+            text = "AI settings (key)"
+            setOnClickListener { showAiDialog() }
+        }
         val help = TextView(this).apply {
             text = "Bubble: tap = pesalam | long-press = 'Hey MS' / 'MS' listening on-off"
             textSize = 14f
@@ -76,8 +90,13 @@ class MainActivity : ComponentActivity() {
         root.addView(stopBtn)
         root.addView(resetBtn)
         root.addView(voiceBtn)
+        root.addView(strictBtn)
+        root.addView(aiBtn)
         root.addView(help)
-        setContentView(root)
+
+        val scroll = ScrollView(this)
+        scroll.addView(root)
+        setContentView(scroll)
     }
 
     private fun setStatus(s: String) = runOnUiThread { status.text = s }
@@ -108,6 +127,65 @@ class MainActivity : ComponentActivity() {
         updateVoiceButton()
     }
 
+    // ---------- Voice strictness (wake match) ----------
+
+    private fun updateStrictButton() {
+        val p = getSharedPreferences(AssistantService.PREFS, Context.MODE_PRIVATE)
+        val cur = p.getFloat(AssistantService.KEY_WAKE_TH, AssistantService.DEFAULT_WAKE_TH)
+        strictBtn.text = String.format(java.util.Locale.US, "Voice strictness: %.2f (tap to change)", cur)
+    }
+
+    private fun cycleStrictness() {
+        val p = getSharedPreferences(AssistantService.PREFS, Context.MODE_PRIVATE)
+        val cur = p.getFloat(AssistantService.KEY_WAKE_TH, AssistantService.DEFAULT_WAKE_TH)
+        var idx = -1
+        for (i in levels.indices) if (abs(levels[i] - cur) < 0.001f) idx = i
+        val next = levels[(idx + 1) % levels.size]
+        p.edit().putFloat(AssistantService.KEY_WAKE_TH, next).apply()
+        updateStrictButton()
+    }
+
+    // ---------- AI settings ----------
+
+    private fun showAiDialog() {
+        val p = getSharedPreferences(AiChat.PREFS, Context.MODE_PRIVATE)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 0)
+        }
+        val keyEt = EditText(this).apply {
+            hint = "API key"
+            setSingleLine(true)
+            setText(p.getString(AiChat.KEY_API, ""))
+        }
+        val modelEt = EditText(this).apply {
+            hint = "Model"
+            setSingleLine(true)
+            setText(p.getString(AiChat.KEY_MODEL, AiChat.DEFAULT_MODEL))
+        }
+        val urlEt = EditText(this).apply {
+            hint = "URL"
+            setSingleLine(true)
+            setText(p.getString(AiChat.KEY_URL, AiChat.DEFAULT_URL))
+        }
+        box.addView(keyEt)
+        box.addView(modelEt)
+        box.addView(urlEt)
+        AlertDialog.Builder(this)
+            .setTitle("AI settings")
+            .setView(box)
+            .setPositiveButton("Save") { _, _ ->
+                p.edit()
+                    .putString(AiChat.KEY_API, keyEt.text.toString().trim())
+                    .putString(AiChat.KEY_MODEL, modelEt.text.toString().trim())
+                    .putString(AiChat.KEY_URL, urlEt.text.toString().trim())
+                    .apply()
+                Toast.makeText(this, "AI settings save aachu", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     // ---------- Start / stop ----------
 
     private fun startAssistant() {
@@ -133,7 +211,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopAssistant() {
-        stopService(Intent(this, AssistantService::class.java))
+        if (AssistantService.running) {
+            startService(Intent(this, AssistantService::class.java).setAction(AssistantService.ACTION_STOP))
+        }
         setStatus("MS nindruduchu.")
     }
 
@@ -177,14 +257,14 @@ class MainActivity : ComponentActivity() {
 
     private fun ensurePermissions() {
         val need = ArrayList<String>()
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            need.add(Manifest.permission.RECORD_AUDIO)
+        }
         if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
             need.add(Manifest.permission.READ_CONTACTS)
         }
         if (checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
             need.add(Manifest.permission.CALL_PHONE)
-        }
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            need.add(Manifest.permission.RECORD_AUDIO)
         }
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
