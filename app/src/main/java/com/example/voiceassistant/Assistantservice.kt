@@ -39,6 +39,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
+import kotlin.math.min
 
 /**
  * Runs MS in the background with a floating bubble.
@@ -47,7 +48,7 @@ import kotlin.math.abs
 class AssistantService : Service() {
 
     companion object {
-        const val VERSION = "v3"
+        const val VERSION = "v4"
         const val ACTION_STOP = "com.example.voiceassistant.STOP"
         const val PREFS = "voice_prefs"
         const val KEY_TAMIL = "use_tamil"
@@ -84,6 +85,7 @@ class AssistantService : Service() {
     private var recognizer: SpeechRecognizer? = null
     private var tone: ToneGenerator? = null
     @Volatile private var sttResults: List<String> = emptyList()
+    @Volatile private var sttError = 0
     @Volatile private var sttLatch: CountDownLatch? = null
 
     private var focusReq: AudioFocusRequest? = null
@@ -281,6 +283,7 @@ class AssistantService : Service() {
 
     private fun requestTalk() {
         talkRequested = true
+        toast("Kekkuren...")
     }
 
     private fun setState(s: Int) {
@@ -302,50 +305,60 @@ class AssistantService : Service() {
         }
     }
 
-    // ---------- Main loop (runs on worker thread) ----------
+    // ---------- Main loop (runs on worker thread, never dies on errors) ----------
 
     private fun wakeThreshold(): Float =
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getFloat(KEY_WAKE_TH, DEFAULT_WAKE_TH)
 
     private fun mainLoop() {
         while (running) {
-            if (talkRequested) {
-                talkRequested = false
-                runCommandFlow()
-                continue
-            }
-            if (!alwaysOn) {
-                setState(STATE_OFF)
+            try {
+                loopOnce()
+            } catch (e: InterruptedException) {
+                return
+            } catch (e: Throwable) {
+                toast("MS error: " + e.javaClass.simpleName + " " + (e.message ?: ""))
+                dropFocus()
+                setState(if (alwaysOn) STATE_WAKE else STATE_OFF)
                 try {
-                    Thread.sleep(120)
-                } catch (e: InterruptedException) {
+                    Thread.sleep(800)
+                } catch (ie: InterruptedException) {
                     return
                 }
-                continue
             }
+        }
+    }
 
-            setState(STATE_WAKE)
-            val audio = AudioCapture.recordUtterance(
-                waitForSpeechMs = 5000,
-                maxSpeechMs = 2500,
-                endSilenceMs = 300,
-                shouldStop = { !running || !alwaysOn || talkRequested }
-            ) ?: continue
-            if (!running || !alwaysOn || talkRequested) continue
+    private fun loopOnce() {
+        if (talkRequested) {
+            talkRequested = false
+            Thread.sleep(300) // let the microphone free up if always-listening was recording
+            runCommandFlow()
+            return
+        }
+        if (!alwaysOn) {
+            setState(STATE_OFF)
+            Thread.sleep(120)
+            return
+        }
 
-            val score = verifier.score(audio)
-            val th = wakeThreshold()
-            if (SHOW_SCORE) {
-                toast(String.format(Locale.US, "Voice match %.2f (need %.2f)", score, th))
-            }
-            if (score >= th) {
-                try {
-                    Thread.sleep(350)
-                } catch (e: InterruptedException) {
-                    return
-                }
-                runCommandFlow()
-            }
+        setState(STATE_WAKE)
+        val audio = AudioCapture.recordUtterance(
+            waitForSpeechMs = 5000,
+            maxSpeechMs = 2500,
+            endSilenceMs = 300,
+            shouldStop = { !running || !alwaysOn || talkRequested }
+        ) ?: return
+        if (!running || !alwaysOn || talkRequested) return
+
+        val score = verifier.score(audio)
+        val th = wakeThreshold()
+        if (SHOW_SCORE) {
+            toast(String.format(Locale.US, "Voice match %.2f (need %.2f)", score, th))
+        }
+        if (score >= th) {
+            Thread.sleep(350)
+            runCommandFlow()
         }
     }
 
@@ -391,7 +404,12 @@ class AssistantService : Service() {
 
     /** Rules did not understand: ask the AI (needs internet and an API key). */
     private fun aiReply(question: String): Reply {
-        if (!AiChat.isConfigured(this)) return Brain.reply(this, question)
+        if (!AiChat.isConfigured(this)) {
+            return Reply(
+                "Puriyala. AI key set pannala. App-la AI settings click panni key podunga.",
+                "புரியல. AI கீ செட் பண்ணல. ஆப்ல AI செட்டிங்ஸ் கிளிக் பண்ணி கீ போடுங்க."
+            )
+        }
         if (!AiChat.hasInternet(this)) {
             return Reply(
                 "Idhukku internet venum. Ippo internet illa.",
@@ -404,6 +422,7 @@ class AssistantService : Service() {
             Reply(a, a)
         } catch (e: Exception) {
             val m = e.message ?: "error"
+            toast("AI: $m")
             if (m.contains("401") || m.contains("403")) {
                 Reply("API key thappu, AI settings-la check pannunga.", "API கீ தப்பு, AI செட்டிங்ஸ்ல செக் பண்ணுங்க.")
             } else if (m.contains("429")) {
@@ -416,10 +435,7 @@ class AssistantService : Service() {
 
     private fun beep() {
         tone?.startTone(ToneGenerator.TONE_PROP_ACK, 100)
-        try {
-            Thread.sleep(150)
-        } catch (e: InterruptedException) {
-        }
+        Thread.sleep(150)
     }
 
     // ---------- Audio focus (pauses songs / videos while MS listens and speaks) ----------
@@ -461,7 +477,10 @@ class AssistantService : Service() {
                 sttResults = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: emptyList()
                 sttLatch?.countDown()
             }
-            override fun onError(error: Int) { sttLatch?.countDown() }
+            override fun onError(error: Int) {
+                sttError = error
+                sttLatch?.countDown()
+            }
             override fun onReadyForSpeech(p: Bundle?) {}
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(v: Float) {}
@@ -473,10 +492,27 @@ class AssistantService : Service() {
         recognizer = rec
     }
 
+    private fun recreateRecognizer() {
+        mainHandler.post {
+            try {
+                recognizer?.destroy()
+            } catch (e: Exception) {
+            }
+            recognizer = null
+            initRecognizer()
+        }
+    }
+
     private fun listenForCommands(): List<String> {
-        val rec = recognizer ?: return emptyList()
+        val rec = recognizer
+        if (rec == null) {
+            toast("Speech service illa. Google app update pannunga.")
+            recreateRecognizer()
+            return emptyList()
+        }
         val latch = CountDownLatch(1)
         sttResults = emptyList()
+        sttError = 0
         sttLatch = latch
 
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -486,10 +522,30 @@ class AssistantService : Service() {
         intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
         intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 500L)
 
-        mainHandler.post { rec.startListening(intent) }
+        mainHandler.post {
+            try {
+                rec.startListening(intent)
+            } catch (e: Exception) {
+                sttError = -1
+                latch.countDown()
+            }
+        }
         val finished = latch.await(10, TimeUnit.SECONDS)
-        if (!finished) mainHandler.post { rec.cancel() }
-        return sttResults.filter { it.isNotBlank() }
+        val results = sttResults.filter { it.isNotBlank() }
+        if (!finished) {
+            mainHandler.post { try { rec.cancel() } catch (e: Exception) { } }
+            toast("Kekkala (timeout). Marupadi sollunga.")
+            recreateRecognizer()
+        } else if (results.isEmpty()) {
+            val err = sttError
+            if (err == SpeechRecognizer.ERROR_NO_MATCH || err == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                toast("Kekkala. Marupadi sollunga.")
+            } else {
+                toast("STT error $err")
+                recreateRecognizer()
+            }
+        }
+        return results
     }
 
     // ---------- Text-to-speech ----------
@@ -498,6 +554,8 @@ class AssistantService : Service() {
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_TAMIL, true)
 
     private fun initTts() {
+        ttsReady = false
+        appliedTamil = -1
         tts = TextToSpeech(this) { code ->
             if (code == TextToSpeech.SUCCESS) {
                 val engine = tts
@@ -512,6 +570,16 @@ class AssistantService : Service() {
                 ttsReady = true
                 applyLanguageIfNeeded()
             }
+        }
+    }
+
+    private fun reinitTts() {
+        mainHandler.post {
+            try {
+                tts?.shutdown()
+            } catch (e: Exception) {
+            }
+            initTts()
         }
     }
 
@@ -535,8 +603,12 @@ class AssistantService : Service() {
     }
 
     private fun speakAndWait(text: String) {
-        val engine = tts ?: return
-        if (!ttsReady) return
+        val engine = tts
+        if (engine == null || !ttsReady) {
+            toast("Voice innum ready aagala. Konjam neram kazhichu try pannunga.")
+            reinitTts()
+            return
+        }
         val latch = CountDownLatch(1)
         val id = "u" + System.nanoTime()
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -547,8 +619,14 @@ class AssistantService : Service() {
         })
         val params = Bundle()
         params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
-        engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
-        latch.await(25, TimeUnit.SECONDS)
+        val r = engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
+        if (r != TextToSpeech.SUCCESS) {
+            toast("Voice error. Voice engine thirumba start aagudhu.")
+            reinitTts()
+            return
+        }
+        val wait = min(25L, 4L + text.length / 6L)
+        latch.await(wait, TimeUnit.SECONDS)
     }
 
     private fun ensureVolume() {
